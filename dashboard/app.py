@@ -9,7 +9,8 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from dashboard.api_client import APIClient
-from backend.presentation import explain_analysis
+from backend.config import APP_VERSION
+from backend.presentation import explain_analysis, explain_origin
 
 
 st.set_page_config(page_title="NETRA-Mail Investigation", page_icon="N", layout="wide")
@@ -107,14 +108,32 @@ def render_email(email_id: str):
     view = result.get("explanation") or explain_analysis({**result, "findings": (findings or {}).get("findings", [])})
     st.subheader(f"{view['classification']} | {score}/100")
     st.info(view["summary"])
+    st.write(view.get("sender_summary", "Review sender identity checks below."))
     c1, c2, c3 = st.columns(3)
     confidence = float(result.get("confidence") or 0)
     c1.metric("Observation confidence", f"{confidence:.0%}" if confidence else "Not estimated")
     c2.metric("Evidence hash", str(result.get("evidence", {}).get("sha256", "Unavailable"))[:18] + "...")
-    c3.metric("Analysis version", result.get("evidence", {}).get("analysis_version", "Unknown"))
+    analysis_version = str(result.get("evidence", {}).get("analysis_version", "Unknown"))
+    c3.metric("Analysis version", analysis_version)
+    if analysis_version not in {"Unknown", APP_VERSION}:
+        st.warning(
+            f"This is a saved result from NETRA {analysis_version}. The current rules are {APP_VERSION}. "
+            "Analyze the email again to apply the latest false-positive and detection fixes."
+        )
     st.caption(view["confidence_note"])
+    decision = result.get("parsed", {}).get("risk_decision", {})
+    for escalation in decision.get("escalations", []):
+        st.warning("High-risk handling rule: " + escalation.get("reason", "Critical evidence requires review"))
+
     tabs = st.tabs(["Why this result?", "Origin trace", "Relationships", "Limitations"])
     with tabs[0]:
+        contributions = view.get("score_contributions", [])
+        if contributions:
+            st.subheader("What contributed to the score")
+            for contribution in contributions:
+                amount = (str(contribution["points"]) + " points") if "points" in contribution else ("Minimum score " + str(contribution.get("floor", "")))
+                st.write(amount + ": " + contribution.get("reason", contribution.get("rule", "Observation")))
+            st.caption("Repeated rules count once at their strongest severity. Minimum-score rules apply as a floor; the total is capped at 100.")
         st.subheader("Why NETRA reached this result")
         if findings_error:
             st.warning("Some finding details could not be loaded: " + findings_error)
@@ -126,6 +145,8 @@ def render_email(email_id: str):
         text = view["text_analysis"]
         st.write("Detected language: " + text["language"])
         st.write(text["summary"])
+        for note in text.get("context_notes", []):
+            st.write("Context considered: " + note)
         for signal in text["signals"]:
             st.write(signal["label"] + ": " + ", ".join(signal["cues"]))
         st.subheader("Link analysis")
@@ -134,12 +155,48 @@ def render_email(email_id: str):
             with st.expander(f"Link {index}: {url['assessment']} | {url['risk_score']}/100", expanded=url["risk_score"] >= 35):
                 st.code(url["url"], language=None)
                 st.write("Destination: " + (url["destination"] or "Not established"))
+                if url.get("label_explanation"):
+                    st.write(url["label_explanation"])
+                for hop in url.get("tracking_chain", []):
+                    st.caption(hop.get("provider", "Redirect") + " — decoded destination, not a live visit")
+                    st.code(hop.get("decoded_target", "Unknown"), language=None)
                 for reason in url["reasons"]:
                     st.write("- " + reason)
                 if not url["reasons"]:
                     st.write("No specific URL warning reported. This does not guarantee the destination is safe.")
                 model = url["model"]
                 st.caption("URL model: " + (str(model.get("classification", "Prediction available")) if model.get("available") else "Unavailable") + "; " + ("contributed with structural evidence" if model.get("used_in_score") else "did not contribute to URL score"))
+        st.subheader("Attachment, QR and OCR analysis")
+        st.write(view["attachment_analysis"]["summary"])
+        for item in view["attachment_analysis"]["attachments"]:
+            with st.expander(f"{item['filename']} | {item.get('assessment_label', item['status'])}", expanded=item["risk_score"] >= 35):
+                st.write(f"Type: {item['content_type']} | Size: {item['size_bytes']} bytes")
+                st.write("**" + item["status"] + "**")
+                if item.get("inspection_help"):
+                    st.info(item["inspection_help"])
+                if item.get("coverage") != "static" and item["risk_score"] >= 35:
+                    st.warning(f"File metadata still indicates risk: {item['risk_score']}/100. Missing content inspection does not remove these warnings.")
+                for reason in item["reasons"]:
+                    st.write("- " + reason)
+                if not item["reasons"] and item.get("coverage") == "static":
+                    st.write("No dangerous static file property was identified.")
+                if item["qr_payloads"]:
+                    st.write("QR decoder found these target(s); NETRA also sends HTTP(S) targets through URL analysis:")
+                    for target in item["qr_payloads"]:
+                        st.code(target, language=None)
+                else:
+                    st.write("QR: no target was decoded.")
+                if item["ocr_text_present"]:
+                    st.write("OCR: readable image text was extracted and included in text analysis.")
+                    if item.get("ocr_text_preview"):
+                        st.write("Redacted OCR preview:")
+                        st.code(item["ocr_text_preview"], language=None)
+                elif item["ocr_available"]:
+                    st.write("OCR ran but found no readable text.")
+                else:
+                    st.write("OCR was unavailable or this attachment is not a supported raster image.")
+                for limitation in item["limitations"]:
+                    st.caption(limitation)
         st.subheader("Sender identity checks")
         if any(item["status"] == "unavailable" for item in view["authentication"]):
             st.info("Visible Gmail content lacks original signed bytes or trusted delivery results. Connect Gmail with Google consent, or upload its original message below.")
@@ -173,65 +230,57 @@ def render_email(email_id: str):
         with st.expander("Technical data for analysts"):
             st.json({"analysis": result, "findings": findings})
     with tabs[1]:
+        st.subheader("Where did this email travel from?")
         if trace_error:
-            st.error(trace_error)
+            st.error("The delivery-route report could not be loaded. This is a report-access problem; it does not establish whether the email contains a public IP.")
+            with st.expander("Technical details for support"):
+                st.write(trace_error)
         else:
-            hops = trace.get("hops", []) or []
-            candidates = trace.get("origin_candidates", []) or []
-            limitations = trace.get("limitations", []) or []
-
-            if not hops:
-                st.warning("Origin trace unavailable for this analysis")
-                st.write(
-                    "The captured Gmail message did not include the trusted Received "
-                    "header chain needed to reconstruct mail-server hops. NETRA will not "
-                    "invent an IP address or sender location."
-                )
-                st.caption(
-                    "To populate this section, analyze the original .eml message with full "
-                    "headers or use a trusted mail-provider/server-side ingestion source."
-                )
-            else:
-                st.subheader("Observed mail-server hops")
-                for index, hop in enumerate(hops, 1):
-                    st.markdown(f"**Hop {index}**  `{hop.get('source_hostname') or 'Unknown'}` -> `{hop.get('destination_hostname') or 'Unknown'}`")
-                    st.caption(f"IP: {hop.get('source_ip') or 'Unknown'} · classification: {', '.join(hop.get('ip_classifications', [])) or 'Unknown'} · timestamp: {hop.get('timestamp') or 'Unavailable'}")
-
-                st.subheader("Origin candidates")
-                if not candidates:
-                    st.info("No defensible public origin candidate was present in the observed hops.")
-                for candidate in candidates:
-                    st.write(f"`{candidate.get('ip')}` · confidence `{float(candidate.get('confidence', 0)):.0%}` · {', '.join(candidate.get('basis', []))}")
-            map_points = []
-            for candidate in candidates:
+            trace = trace or {}
+            candidates = trace.get("origin_candidates") or []
+            enriched = []
+            for candidate in candidates[:8]:
+                candidate = dict(candidate)
                 ip = str(candidate.get("ip") or "")
-                if not ip:
-                    continue
-                intel, intel_error = safe_call(client.ip_intelligence, ip)
-                if intel_error or not intel or not intel.get("available"):
-                    continue
-                st.caption(
-                    f"Registered network: {intel.get('city') or 'Unknown'}, "
-                    f"{intel.get('region') or intel.get('country') or 'Unknown'} | "
-                    f"ASN: {intel.get('asn') or 'Unknown'} | "
-                    f"Provider: {intel.get('organization') or intel.get('isp') or 'Unknown'}"
-                )
-                try:
-                    latitude = float(intel.get("latitude"))
-                    longitude = float(intel.get("longitude"))
-                    if latitude or longitude:
-                        map_points.append({"lat": latitude, "lon": longitude, "ip": ip})
-                except (TypeError, ValueError):
-                    pass
-            if map_points:
-                st.subheader("Origin infrastructure map")
-                st.map(map_points, latitude="lat", longitude="lon", size=120)
-            if candidates:
-                st.info("Geolocation is infrastructure intelligence and does not prove the sender's physical location.")
-            if limitations:
-                with st.expander("Origin-trace limitations"):
-                    for limitation in limitations:
-                        st.write(f"- {limitation}")
+                intel = candidate.get("intelligence") or {}
+                if ip and not intel.get("available"):
+                    fresh, error = safe_call(client.ip_intelligence, ip)
+                    if not error and fresh:
+                        candidate["intelligence"] = fresh
+                    elif error:
+                        candidate["intelligence"] = {"available": False, "source": "dashboard_lookup_failed"}
+                enriched.append(candidate)
+            view_origin = explain_origin({**trace, "origin_candidates": enriched})
+            st.subheader(view_origin["title"])
+            st.write(view_origin["summary"])
+            st.info(view_origin["sender_location"])
+            st.write("**What you can do:** " + view_origin["next_step"])
+            points = []
+            for server in view_origin["servers"]:
+                with st.container(border=True):
+                    st.markdown("**Mail-server IP:** `" + server["ip"] + "`")
+                    st.caption(server["role"])
+                    st.write("**" + server["status"] + "**")
+                    st.write(server["explanation"])
+                    st.write(server["location"])
+                    st.write(server["network"])
+                    if server["asn"]:
+                        st.write("Network number (ASN): " + str(server["asn"]))
+                    st.caption("Evidence: " + server["evidence"])
+                    st.caption("Location provider: " + server["provider"] + " | Lookup time: " + server["looked_up_at"])
+                    if server["plan_note"]:
+                        st.info(server["plan_note"])
+                    st.write(server["anonymization"])
+                    if server["coordinates"]:
+                        points.append(server["coordinates"])
+            if points:
+                st.subheader("Approximate locations of observed mail servers")
+                st.caption("Map markers describe infrastructure. They do not locate the person who sent the email.")
+                st.map(points, latitude="lat", longitude="lon", size=120)
+            if len(candidates) > 8:
+                st.caption("Showing the first eight server candidates to keep location lookups bounded.")
+            with st.expander("Delivery route and technical evidence for analysts"):
+                st.json(trace)
     with tabs[2]:
         graph, graph_error = safe_call(client.graph, email_id)
         if graph and not graph_error:

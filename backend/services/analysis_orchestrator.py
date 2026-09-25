@@ -7,6 +7,9 @@ from uuid import uuid4
 from backend.attachment_analyzer import AttachmentAnalyzer
 from backend.header_analyzer import HeaderForensicAnalyzer
 from backend.nlp_engine import NLPEngine
+# Resolve sklearn imports before concurrent first requests can interleave module locks.
+from backend.ml_classifier import LocalMLClassifier
+from backend.services.phrase_similarity import inspect_phrases
 from backend.parser import ForensicEmailParser
 
 from backend.schemas.findings import (
@@ -36,7 +39,7 @@ except Exception:
     URLAnalyzer = None
 class AnalysisOrchestrator:
     """
-    Pure, dependency-light v2 analysis pipeline.
+    V2 analysis pipeline with explicitly provisioned local models.
 
     Multilingual support:
     - Detects supported Indian languages.
@@ -47,7 +50,7 @@ class AnalysisOrchestrator:
     - Language alone is never considered malicious.
     """
 
-    VERSION = "4.4.1"
+    VERSION = "4.5.5"
 
     def __init__(
         self,
@@ -179,6 +182,7 @@ class AnalysisOrchestrator:
     def _build_multilingual_findings(
         self,
         multilingual: Dict[str, Any],
+        text: str = "",
     ) -> List[Finding]:
         """
         Convert multilingual detector results into normal V2 Finding
@@ -364,6 +368,19 @@ class AnalysisOrchestrator:
                 )
             )
 
+        from backend.services.financial_context import request_evidence
+        from backend.compliance import IndiaPrivacyPreserver
+        requests = request_evidence(text, categories)
+        for finding in findings:
+            required = 'financial_fraud' if finding.rule == 'multilingual_financial_fraud' else 'credential_harvesting'
+            matching = [r for r in requests if (r['categories'].get(required) if finding.rule != 'multilingual_contextual_social_engineering' else r['categories'].get('urgency'))]
+            if not matching:
+                finding.severity = 'info'
+                finding.title = 'Language observation without an established harmful request'
+                finding.description = 'Financial or credential terminology alone does not establish fraud. No related request was established in the same passage.'
+            else:
+                finding.evidence['matched_passages'] = [IndiaPrivacyPreserver.redact_text(r['passage']) for r in matching[:3]]
+            finding.limitations.append('Bounded passage rules are not a complete understanding of language or intent.')
         return findings
 
     # ------------------------------------------------------------------
@@ -403,34 +420,10 @@ class AnalysisOrchestrator:
             {},
         ) or {}
 
-        text = "\n".join(
-            str(value)
-            for value in (
-                metadata.get(
-                    "subject",
-                    "",
-                ),
-                metadata.get(
-                    "from",
-                    "",
-                ),
-                body.get(
-                    "plain",
-                    "",
-                ),
-                body.get(
-                    "visible_text",
-                    "",
-                ),
-            )
-        )
-
-        image_text = "\n".join(
-            str(item.get("image_analysis", {}).get("ocr_text", ""))
-            for item in parsed.get("attachments", [])
-        )[:20000]
-        if image_text:
-            text += "\n" + image_text
+        from backend.services.email_features import email_feature_text
+        text = email_feature_text(parsed)
+        from backend.services.financial_context import request_text
+        lexical_text, contextual_observations = request_text(text)
 
         # ==============================================================
         # 2. EXISTING NLP
@@ -438,11 +431,12 @@ class AnalysisOrchestrator:
 
         nlp = (
             NLPEngine.analyze_text(
-                text
+                lexical_text
             )
             or {}
         )
 
+        nlp["contextual_observations"] = contextual_observations
         # Keep a copy of the original English NLP categories.
         #
         # This is important because multilingual categories should not
@@ -505,6 +499,7 @@ class AnalysisOrchestrator:
         findings: List[Finding] = []
         from backend.services.content_signals import inspect_content
         findings.extend(inspect_content(text, str(body.get("html", ""))))
+        findings.extend(inspect_phrases(text))
 
         # --------------------------------------------------------------
         # MULTILINGUAL FINDINGS
@@ -512,7 +507,7 @@ class AnalysisOrchestrator:
 
         findings.extend(
             self._build_multilingual_findings(
-                multilingual
+                multilingual, lexical_text
             )
         )
 
@@ -556,14 +551,20 @@ class AnalysisOrchestrator:
         # ==============================================================
 
         # Generic request words are not independent authority evidence.
-        generic = {"require", "required", "requires", "request", "requested", "please", "action required"}
+        generic = {"require", "required", "requires", "request", "requested", "please", "action required", "trusted", "manager"}
         social = [cue for cue in social if str(cue).lower() not in generic]
         if "social_engineering" in nlp.get("categories", {}):
             nlp["categories"]["social_engineering"] = [
                 cue for cue in nlp["categories"]["social_engineering"]
                 if str(cue).lower() not in generic
             ]
-        if urgency and (
+        import re
+        from backend.services.financial_context import request_evidence
+        from backend.compliance import IndiaPrivacyPreserver
+        sensitive_requests = request_evidence(lexical_text, original_categories)
+        sensitive_request = bool(sensitive_requests)
+        pressured_requests = [r for r in sensitive_requests if r['categories'].get('urgency')]
+        if pressured_requests and (
             credentials
             or financial
             or social
@@ -581,6 +582,7 @@ class AnalysisOrchestrator:
                     ),
                     {
                         "urgency": urgency[:5],
+                        "matched_passages": [IndiaPrivacyPreserver.redact_text(r['passage']) for r in pressured_requests[:3]],
                         "related_categories": [
                             key
                             for key, value in (
@@ -668,6 +670,17 @@ class AnalysisOrchestrator:
         verified = parsed["verified_authentication"]
         for item in header.get("findings", []):
             item = dict(item)
+            if item.get("rule") in {"spf_failure", "dkim_failure", "dmarc_failure", "spf_misalignment", "dkim_misalignment", "dmarc_misalignment"}:
+                item["severity"] = "info"
+                item.setdefault("limitations", []).append("Uploaded authentication claims are not independent verification; trusted failures are recorded separately.")
+            if item.get("rule") in {"from_return_path_mismatch", "from_reply_to_mismatch", "received_timestamp_order", "malformed_received"}:
+                item["severity"] = "low"
+                item.setdefault("limitations", []).append("Infrastructure and forwarding differences are weak context; they do not independently establish an attack.")
+            if item.get("rule") == "message_id_domain_mismatch":
+                item["severity"] = "info"
+            if verified.get("dmarc", {}).get("status") == "pass" and item.get("rule") == "from_return_path_mismatch":
+                item["severity"] = "info"
+                item.setdefault("limitations", []).append("Aligned DMARC passed. A separate envelope return path is normal for outsourced delivery and is not a spoofing failure.")
             if verified["dmarc"]["status"] == "pass" and item.get("rule") in {"spf_misalignment", "dkim_misalignment", "dmarc_misalignment"}:
                 item["severity"] = "info"
                 item.setdefault("limitations", []).append("Verified DMARC passed through at least one aligned identifier.")
@@ -680,6 +693,9 @@ class AnalysisOrchestrator:
             "independently_verified": False,
             "limitations": ["Supplied authentication headers may be forged. Refer to verified_authentication for local DKIM checks."]
         }
+        if verified.get("spf", {}).get("status") == "fail" and verified.get("spf", {}).get("source") in {"trusted_receiver", "trusted_smtp_context"}:
+            findings.append(Finding(category="Authentication", rule="trusted_spf_failure", severity="medium", confidence=.9,
+                title="Trusted delivery receiver reported SPF failure", description="The SMTP sending IP failed the receiving provider's authorization check.", evidence=verified["spf"], limitations=verified["limitations"]))
         if verified["dkim"]["status"] == "fail":
             findings.append(Finding(
                 category="Authentication", rule="local_dkim_failure", severity="medium",
@@ -725,8 +741,9 @@ class AnalysisOrchestrator:
                 target = str(reference.get("href", ""))
                 if len(expansions) >= 2:
                     break
-                if URLAnalyzer.analyze_url(target).get("is_shortener"):
-                    expansion = URLExpander.expand(target)
+                preliminary = URLAnalyzer.analyze_url(target)
+                if preliminary.get("is_shortener"):
+                    expansion = URLExpander.expand(preliminary.get("redirect_target") or target)
                     expansions.append(expansion)
                     if expansion.get("expanded"):
                         references.append({"href": expansion["final_url"], "visible_text": "Expanded short URL"})
@@ -746,19 +763,56 @@ class AnalysisOrchestrator:
         parsed["url_analysis"] = url_result
 
         sender_domain = str(verified.get("dmarc", {}).get("from_domain", "")).lower().rstrip(".")
+        def belongs_to(host, root):
+            host = str(host or "").lower().rstrip(".")
+            root = str(root or "").lower().rstrip(".")
+            return bool(host and root and (host == root or host.endswith("." + root)))
+
+        def same_verified_organization(host):
+            """Relate authenticated senders to another published brand domain.
+
+            This is deliberately narrower than a whitelist: it only operates
+            after trusted DMARC passes and never suppresses hard destination or
+            reputation checks.  It handles organizations migrating between
+            domains, such as ``sbi.co.in`` and the controlled ``sbi.bank.in``.
+            """
+            if verified.get("dmarc", {}).get("status") != "pass":
+                return False
+            host = str(host or "").lower().rstrip(".")
+            for domains in URLAnalyzer.BRANDS.values():
+                sender_matches = any(belongs_to(sender_domain, domain) for domain in domains)
+                target_matches = any(belongs_to(host, domain) for domain in domains)
+                if sender_matches and target_matches:
+                    return True
+            return False
+
         def aligned_first_party(item):
-            registered = str(item.get("registered_domain", "")).lower().rstrip(".")
-            return verified.get("dmarc", {}).get("status") == "pass" and bool(registered) and (
-                sender_domain == registered or sender_domain.endswith("." + registered)
+            if item.get("wrapper_structural_warning"):
+                return False
+            registered = str(
+                item.get("registered_domain")
+                or item.get("actual_registered_domain")
+                or ""
+            ).lower().rstrip(".")
+            actual_host = str(item.get("actual_host") or item.get("hostname") or "").lower().rstrip(".")
+            return verified.get("dmarc", {}).get("status") == "pass" and (
+                (bool(registered) and belongs_to(sender_domain, registered))
+                or same_verified_organization(actual_host)
+                or same_verified_organization(registered)
             )
         for item in url_result.get("findings", []):
             item = dict(item)
-            if aligned_first_party(item.get("evidence", {})):
+            if item.get("rule") in {"suspicious_url_features", "visible_href_mismatch", "same_domain_link_host_difference"} and aligned_first_party(item.get("evidence", {})):
                 item["severity"] = "info"
                 item.setdefault("limitations", []).append("The URL is first-party aligned with an independently authenticated sender; heuristic structure alone is insufficient for a threat verdict.")
             findings.append(item)
+        for item in url_result.get("urls", []):
+            item["authenticated_sender_context"] = aligned_first_party(item)
         from backend.intelligence.reputation_provider import URLReputationProvider
-        reputation = URLReputationProvider().lookup([str(item.get("href", "")) for item in references])
+        reputation = URLReputationProvider().lookup(list(dict.fromkeys(
+            [str(item.get("redirect_target")) for item in url_result.get("urls", []) if item.get("redirect_target")]
+            + [str(item.get("href", "")) for item in references]
+        )))
         parsed["url_reputation"] = reputation
         findings.extend(reputation.get("findings", []))
         suspicious_urls = [item for item in url_result.get("urls", []) if int(item.get("risk_score", 0)) >= 35 and not aligned_first_party(item)]
@@ -770,7 +824,7 @@ class AnalysisOrchestrator:
             cue for cue in credentials
             if str(cue).strip().lower() not in weak_credential_context
         ]
-        if strong_credentials and suspicious_urls:
+        if strong_credentials and suspicious_urls and sensitive_request:
             findings.append(self._finding(
                 "Text", "credential_request_with_suspicious_link", "high", 0.9,
                 "Credential request includes a suspicious link",
@@ -798,7 +852,7 @@ class AnalysisOrchestrator:
                 continue
             severity = "critical" if score >= 75 else "high" if score >= 50 else "medium"
             findings.append(Finding(
-                category="Attachment", rule="attachment_static_" + severity,
+                category="Attachment", rule="attachment_hash_blocklist" if attachment.get("reputation", {}).get("matched") else "attachment_static_" + severity,
                 severity=severity, confidence=0.95,
                 title="Potentially dangerous attachment",
                 description="; ".join(attachment.get("reasons", [])),
@@ -939,7 +993,20 @@ class AnalysisOrchestrator:
         # 13. EMAIL ML AS CORROBORATED SUPPORTING EVIDENCE
         # ==============================================================
 
-        from backend.ml_classifier import LocalMLClassifier
+        structural_warning = any(
+            str(getattr(item, "severity", item.get("severity", "info") if isinstance(item, dict) else "info")).lower()
+            in {"medium", "high", "critical"}
+            and str(getattr(item, "category", item.get("category", "") if isinstance(item, dict) else "")).lower()
+            in {"authentication", "url", "attachment", "sender identity", "bec"}
+            for item in findings
+        )
+        verified_dmarc = verified.get("dmarc", {})
+        trusted_transactional_context = (
+            (verified_dmarc.get("status") == "pass" or verified_dmarc.get("receiver_status") in {"pass", "bestguesspass"})
+            and not structural_warning
+        )
+        nlp["trusted_transactional_context"] = trusted_transactional_context
+
         try:
             ml_analysis = {"available": True, **LocalMLClassifier.predict(text)}
             probability = float(ml_analysis.get("phishing_probability", 0.0))
@@ -949,7 +1016,26 @@ class AnalysisOrchestrator:
                 in {"medium", "high", "critical"}
             ]
             ml_analysis["used_in_decision"] = False
-            if probability >= 0.55 and corroborating:
+            hard_structural = any(str(getattr(item, "severity", item.get("severity", "info") if isinstance(item, dict) else "info")).lower() in {"high", "critical"} for item in findings)
+            if ml_analysis.get("calibration_status") == "platt_scaling" and probability >= 0.60 and not hard_structural and not trusted_transactional_context:
+                findings.append(self._finding(
+                    "Machine learning", "calibrated_ml_review", "medium", probability,
+                    "Calibrated text model requests review",
+                    "Structural evidence is inconclusive; the calibrated text model detects attack-like language. This is an inconclusive review, not confirmed phishing.",
+                    {"phishing_probability": round(probability, 4), "threshold": 0.60},
+                    ml_analysis.get("limitations", []),
+                ))
+                ml_analysis["used_in_decision"] = True
+            elif ml_analysis.get("calibration_status") == "platt_scaling" and probability >= 0.60 and not hard_structural:
+                findings.append(self._finding(
+                    "Machine learning", "calibrated_ml_observation", "low", probability,
+                    "Text model noticed attack-like wording",
+                    "The calibrated text model noticed wording seen in attacks, but its confidence is insufficient to change the verdict without technical evidence.",
+                    {"phishing_probability": round(probability, 4), "review_threshold": 0.60,
+                     "authenticated_transactional_context": trusted_transactional_context},
+                    ml_analysis.get("limitations", []),
+                ))
+            if probability >= 0.55 and corroborating and not hard_structural and not ml_analysis["used_in_decision"]:
                 severity = "medium" if probability >= 0.75 and len(corroborating) >= 2 else "low"
                 findings.append(self._finding(
                     "Machine learning", "corroborated_email_ml", severity,
@@ -993,6 +1079,7 @@ class AnalysisOrchestrator:
             normalized_findings,
             nlp,
         )
+        parsed["risk_decision"] = risk
 
         # ==============================================================
         # 16. MULTILINGUAL RESULT
@@ -1116,6 +1203,7 @@ class AnalysisOrchestrator:
         sanitized = dict(
             parsed
         )
+        from backend.compliance import IndiaPrivacyPreserver
         sanitized.pop(
             "raw_bytes",
             None,
@@ -1126,8 +1214,8 @@ class AnalysisOrchestrator:
             if ocr_text:
                 image["ocr_text_sha256"] = hashlib.sha256(ocr_text.encode("utf-8")).hexdigest()
                 image["ocr_character_count"] = len(ocr_text)
+                image["ocr_text_preview"] = IndiaPrivacyPreserver.redact_text(ocr_text[:600])
         # Raw originals remain in evidence storage, not in routine API results.
-        from backend.compliance import IndiaPrivacyPreserver
         sanitized["body"] = IndiaPrivacyPreserver.redact_structure(sanitized.get("body") or {})
 
         # ==============================================================

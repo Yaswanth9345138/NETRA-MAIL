@@ -101,10 +101,11 @@ class URLAnalyzer:
         ],
         "SBI": [
             "sbi.co.in",
-            "onlinesbi.sbi",
+            "sbi.bank.in",
         ],
         "HDFC": [
             "hdfcbank.com",
+            "hdfcbank.bank.in",
         ],
         "ICICI": [
             "icicibank.com",
@@ -424,38 +425,8 @@ class URLAnalyzer:
 
     @classmethod
     def _base_domain(cls, hostname):
-
-        labels = [
-            x
-            for x in hostname.split(".")
-            if x
-        ]
-
-        if len(labels) < 2:
-            return hostname
-
-        # Common multi-part public suffixes.
-        if (
-            len(labels) >= 3
-            and labels[-2] in {
-                "co",
-                "com",
-                "net",
-                "org",
-                "gov",
-                "ac",
-                "edu",
-            }
-            and len(labels[-1]) in {2, 3}
-        ):
-
-            return ".".join(
-                labels[-3:]
-            )
-
-        return ".".join(
-            labels[-2:]
-        )
+        from backend.domain_identity import registered_identity
+        return registered_identity(hostname) or hostname
 
     # ============================================================
     # STATIC SSRF / INTERNAL DESTINATION CLASSIFICATION
@@ -544,7 +515,7 @@ class URLAnalyzer:
     # ============================================================
 
     @classmethod
-    def analyze_url(cls, url):
+    def analyze_url(cls, url, _depth=0):
 
         result = {
 
@@ -674,24 +645,32 @@ class URLAnalyzer:
             == "https"
         )
 
-        # Gmail commonly rewrites legitimate links through Google's /url
-        # redirect endpoint. Analyze the embedded destination instead of
-        # treating wrapper length and encoded parameters as attacker signals.
-        if (
-            hostname in {"google.com", "www.google.com"}
-            and parsed.path.rstrip("/") == "/url"
-        ):
-            query_values = parse_qs(parsed.query, keep_blank_values=False)
-            target_values = query_values.get("q") or query_values.get("url") or []
-            target = str(target_values[0]).strip() if target_values else ""
-            target_parsed = urlparse(target)
-            if target and target != str(url) and target_parsed.scheme in {"http", "https"} and target_parsed.hostname:
-                nested = cls.analyze_url(target)
+        from backend.tracking_links import embedded_destination
+        redirect = embedded_destination(str(url)) if _depth < 4 else None
+        if redirect:
+            target = redirect["target"]
+            if target != str(url):
+                nested = cls.analyze_url(target, _depth + 1)
+                # Arbitrary redirect-parameter hosts are still inspected. Only
+                # the recipient-specific query is removed from their lexical check.
+                wrapper = None if redirect["standard_provider"] else cls.analyze_url(parsed._replace(query="", fragment="").geturl(), 4)
+                if wrapper and wrapper["risk_score"] > nested["risk_score"]:
+                    nested["risk_score"] = wrapper["risk_score"]
+                    nested["risk_level"] = wrapper["risk_level"]
+                    nested["risk_reasons"] += wrapper["risk_reasons"]
+                if wrapper:
+                    nested["wrapper_structural_warning"] = wrapper["risk_score"] >= 35
+                    for flag in ("ssrf_risk", "is_ip_address", "port_present"):
+                        nested[flag] = nested.get(flag, False) or wrapper.get(flag, False)
+                    if wrapper.get("homograph", {}).get("lookalike"):
+                        nested["homograph"] = wrapper["homograph"]
+                nested["tracking_chain"] = [{"url": str(url), "decoded_target": target, "provider": redirect["provider"]}, *nested.get("tracking_chain", [])]
+                nested["destination_status"] = "Decoded from link text; live redirect not verified"
                 nested["url"] = str(url)
                 nested["redirect_wrapper"] = hostname
-                nested["redirect_target"] = target
+                nested["redirect_target"] = nested.get("redirect_target") or target
                 nested["risk_reasons"] = list(dict.fromkeys([
-                    "Known Google redirect wrapper; embedded destination analyzed directly",
+                    "Tracking wrapper decoded; embedded destination inspected without opening the link",
                     *nested.get("risk_reasons", []),
                 ]))
                 return nested
@@ -875,11 +854,12 @@ class URLAnalyzer:
 
             result["punycode"] = True
 
-            result["risk_score"] += 25
-
-            result["risk_reasons"].append(
-                "Hostname contains IDN/punycode or non-ASCII characters"
-            )
+            from backend.domain_confusables import inspect_hostname
+            confusable = inspect_hostname(hostname, cls.BRANDS)
+            result["homograph"] = confusable
+            if confusable["lookalike"]:
+                result["risk_score"] += 35
+                result["risk_reasons"].append("Internationalized hostname resembles a protected brand")
 
         # --------------------------------------------------------
         # Suspicious TLD
@@ -1761,7 +1741,7 @@ class URLAnalyzer:
             if not href or href.lower().startswith(("javascript:", "data:", "mailto:")):
                 continue
             result = cls.analyze_url(href)
-            parsed = urlparse(href)
+            parsed = urlparse(result.get("redirect_target") or href)
             if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
                 continue
             hostname = (parsed.hostname or "").lower()
@@ -1781,15 +1761,24 @@ class URLAnalyzer:
             result["visible_text"] = visible
             result["href"] = href
             result["visible_host"] = visible_host
-            result["visible_href_mismatch"] = bool(visible_host and visible_host != hostname)
+            from backend.domain_identity import compare_link_hosts
+            comparison = compare_link_hosts(visible_host, hostname)
+            result["link_host_comparison"] = comparison
+            result["visible_href_mismatch"] = comparison["deceptive_domain_mismatch"]
+            result["same_domain_host_difference"] = comparison["host_differs"] and comparison["same_registered_domain"]
             result["mixed_script"] = any(ord(char) > 127 for char in hostname) and "xn--" not in hostname
             results.append(result)
+            if result.get("same_domain_host_difference"):
+                findings.append({"finding_id": str(uuid4()), "category": "URL", "rule": "same_domain_link_host_difference", "severity": "info", "confidence": 0.94,
+                    "title": "Link uses another subdomain of the same registered domain",
+                    "description": "The displayed address and destination use different subdomains under the same registered domain. That difference alone is not evidence of phishing; the destination is still checked for other risks.",
+                    "evidence": {**comparison, "href": href}, "limitations": ["Shared registered domain does not guarantee safety; a subdomain or account may be compromised."]})
             if result.get("visible_href_mismatch"):
-                findings.append({"finding_id": str(uuid4()), "category": "URL", "rule": "visible_href_mismatch", "severity": "high", "confidence": 0.94, "title": "Visible link destination differs from href", "description": "The visible link text points to a different host than the actual href.", "evidence": {"visible_host": visible_host, "actual_host": hostname, "href": href}, "limitations": ["A mismatch can also be caused by intentionally shortened or redirected links."]})
+                findings.append({"finding_id": str(uuid4()), "category": "URL", "rule": "visible_href_mismatch", "severity": "high", "confidence": 0.94, "title": "Visible link destination differs from href", "description": "The displayed address and actual destination belong to different registered domains, or a shared domain could not be established.", "evidence": {**comparison, "href": href}, "limitations": ["A mismatch can also be caused by intentionally shortened or redirected links."]})
             rules = []
             if result.get("is_shortener"):
-                rules.append(("url_shortener", "medium", 0.88, "URL shortener detected", "The destination is obscured behind a known URL shortening service."))
-            if result.get("punycode") or result.get("mixed_script"):
+                rules.append(("url_shortener", "low", 0.88, "Shortened link destination needs verification", "The final destination is hidden by a shortening service. This is uncertainty, not confirmation of phishing; independent destination warnings still apply."))
+            if result.get("homograph", {}).get("lookalike"):
                 rules.append(("idn_or_mixed_script", "high", 0.91, "Internationalized or mixed-script hostname detected", "The hostname uses IDN, punycode, or non-ASCII characters that can resemble another domain."))
             if result.get("is_ip_address"):
                 rules.append(("ip_based_url", "medium", 0.86, "URL uses an IP address", "The link uses a raw IP address instead of a registered domain."))
@@ -1798,7 +1787,7 @@ class URLAnalyzer:
             if result.get("port_present") or parsed.port not in (None, 80, 443):
                 rules.append(("suspicious_port", "medium", 0.8, "URL uses a non-standard port", "The URL specifies a port outside the normal HTTP or HTTPS ports."))
             if result.get("risk_score", 0) >= 50:
-                rules.append(("suspicious_url_features", "high", 0.82, "Suspicious URL characteristics detected", "The URL contains multiple credential, brand, redirect, or infrastructure signals."))
+                rules.append(("suspicious_url_features", "high", 0.82, "Multiple URL characteristics need review", "The actionable URL combines structural warning characteristics. Background image, font and tracking-pixel resources are excluded from this check."))
             for rule, severity, confidence, title, description in rules:
-                findings.append({"finding_id": str(uuid4()), "category": "URL", "rule": rule, "severity": severity, "confidence": confidence, "title": title, "description": description, "evidence": {"url": href, "hostname": hostname, "registered_domain": result.get("registered_domain"), "risk_score": result.get("risk_score", 0), "risk_reasons": result.get("risk_reasons", [])[:10]}, "limitations": ["No DNS resolution or remote URL fetch was performed; redirect chains and live reputation are not inferred."]})
+                findings.append({"finding_id": str(uuid4()), "category": "URL", "rule": rule, "severity": severity, "confidence": confidence, "title": title, "description": description, "evidence": {"url": href, "hostname": hostname, "registered_domain": result.get("registered_domain"), "risk_score": result.get("risk_score", 0), "wrapper_structural_warning": result.get("wrapper_structural_warning", False), "risk_reasons": result.get("risk_reasons", [])[:10]}, "limitations": ["No DNS resolution or remote URL fetch was performed; redirect chains and live reputation are not inferred."]})
         return {"urls": results, "findings": findings, "highest_risk": max((item.get("risk_score", 0) for item in results), default=0), "redirect_chain": [], "network_fetch_performed": False}

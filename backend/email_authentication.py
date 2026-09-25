@@ -84,6 +84,21 @@ class EmailAuthenticationVerifier:
         spf_identity = spf_match.group(2) if spf_match else ""
         spf = {"status": spf_match.group(1).lower() if spf_match else "unavailable", "domain": _domain(spf_identity) or spf_identity.lower().rstrip("."), "source": "trusted_receiver" if spf_match else "unavailable"}
         spf["reason"] = ("The delivery receiver reported this SPF result at receipt." if spf_match else "SPF needs the real SMTP session or delivery results fetched directly from Gmail; visible text and uploaded headers cannot establish it.")
+        # Only inspect the receiver's selected Authentication-Results SPF
+        # segment, never arbitrary body text or older uploaded header claims.
+        if trusted:
+            import ipaddress
+            segment = re.search(r"\bspf=[^;]+", combined, re.I)
+            if segment:
+                found = re.search(r"(?:client-ip\s*=\s*|designates\s+)([0-9a-fA-F:.]+)", segment.group(0), re.I)
+                if found:
+                    try:
+                        address = ipaddress.ip_address(found.group(1))
+                        if address.is_global:
+                            spf["client_ip"] = str(address)
+                            spf["client_ip_source"] = "gmail_authentication_results"
+                    except ValueError:
+                        pass
         receiver_dkim = re.search(r"\bdkim=(pass|fail|none|neutral|temperror|permerror)\b", combined, re.I)
         if receiver_dkim:
             dkim_result["receiver_status"] = receiver_dkim.group(1).lower()
@@ -99,6 +114,14 @@ class EmailAuthenticationVerifier:
             dmarc["receiver_status"] = dmarc_match.group(1).lower()
             dmarc["receiver_from_domain"] = dmarc_match.group(2).lower().rstrip(".")
         dmarc["reason"] = "Local alignment uses verified signatures and trusted sending-server results." if dmarc["status"] != "unavailable" else "No verified aligned signature or trusted sending-server result was available for local alignment."
+        # Receipt-time verification can use signing keys no longer available
+        # during a later recheck. Only provider-fetched bytes establish trust;
+        # an uploaded Authentication-Results header never enters this branch.
+        if dmarc_match and dmarc["receiver_from_domain"] == from_domain and dmarc["receiver_status"] in {"pass", "fail"}:
+            dmarc["local_alignment_status"] = dmarc["status"]
+            dmarc["status"] = dmarc["receiver_status"]
+            dmarc["source"] = "trusted_receiver"
+            dmarc["reason"] = "Gmail reported this DMARC result at delivery for the visible sender domain. The later local alignment recheck is recorded separately."
         return {"status": dkim_result.get("status", "unavailable"), "signatures": dkim_result.get("signatures", []),
             "dkim": dkim_result, "spf": spf, "dmarc": dmarc, "arc": arc_result,
             "trusted_authserv_ids": sorted(active_trust),

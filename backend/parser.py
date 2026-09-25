@@ -24,6 +24,7 @@ class _SafeHTMLExtractor(HTMLParser):
         self.forms: List[Dict[str, Any]] = []
         self.hidden_elements: List[Dict[str, str]] = []
         self.links: List[Dict[str, str]] = []
+        self._active_link: Dict[str, str] | None = None
         self.inline_images: List[Dict[str, str]] = []
         self._form: Dict[str, Any] | None = None
         self._form_text: List[str] = []
@@ -65,8 +66,11 @@ class _SafeHTMLExtractor(HTMLParser):
                 }
             )
 
-        if tag == "a" and attributes.get("href"):
-            self.links.append({"href": attributes["href"], "visible_text": ""})
+        if tag == "a":
+            self._active_link = None
+            if attributes.get("href") and not suppressed:
+                self._active_link = {"href": attributes["href"], "visible_text": ""}
+                self.links.append(self._active_link)
 
         if tag == "img" and attributes.get("src"):
             self.inline_images.append(
@@ -78,6 +82,8 @@ class _SafeHTMLExtractor(HTMLParser):
             )
 
     def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "a":
+            self._active_link = None
         for index in range(len(self._visibility_stack) - 1, -1, -1):
             if self._visibility_stack[index][0] == tag.lower():
                 del self._visibility_stack[index:]
@@ -100,9 +106,9 @@ class _SafeHTMLExtractor(HTMLParser):
         if self._form is not None:
             self._form_text.append(text)
 
-        if self.links:
-            self.links[-1]["visible_text"] = (
-                self.links[-1]["visible_text"] + " " + text
+        if self._active_link is not None:
+            self._active_link["visible_text"] = (
+                self._active_link["visible_text"] + " " + text
             ).strip()
 
 
@@ -174,7 +180,13 @@ class ForensicEmailParser:
         header_text = "\n".join(
             f"{key}: {value}" for key, value in header_items
         )
-        combined_for_urls = "\n".join([plain, html, header_text])
+        # Analyze destinations a person can act on: visible body URLs and
+        # anchor hrefs. Raw HTML also contains pixels, fonts, images and CSS
+        # resources; treating those background resources as clicked links
+        # creates false positives in legitimate newsletters and bank mail.
+        combined_for_urls = "\n".join(
+            [plain, html_details["visible_text"]]
+        )
         urls = self._extract_urls(combined_for_urls)
 
         # Add hrefs that are not present in visible/plain text, while keeping
@@ -192,7 +204,14 @@ class ForensicEmailParser:
             except Exception:
                 continue
 
-            if normalized not in urls and normalized != href:
+            # Absolute anchor destinations may not be repeated in visible
+            # text. Preserve them, while rejecting relative links resolved
+            # only against the parser's placeholder base.
+            if (
+                normalized not in urls
+                and "placeholder.invalid" not in normalized
+                and normalized.lower().startswith(("http://", "https://"))
+            ):
                 urls.append(normalized)
 
             if len(urls) >= self.MAX_URLS:

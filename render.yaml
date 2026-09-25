@@ -38,8 +38,14 @@ services:
         value: /var/data/forensic_ledger.db
       - key: NETRA_EVIDENCE_STORAGE_DIR
         value: /var/data/evidence
+      - key: NETRA_IP_INTEL_URL
+        value: https://ipwho.is
+      - key: NETRA_IPSTACK_API_KEY
+        sync: false
       - key: NETRA_URL_REPUTATION_ENABLED
         value: "false"
+      - key: NETRA_INSPECTION_MODE
+        value: portable
 
   - type: web
     name: netra-mail-dashboard
